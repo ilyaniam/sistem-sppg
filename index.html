@@ -1,0 +1,760 @@
+// backend/server.js
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
+const morgan = require('morgan');
+const { Pool } = require('pg');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+const QRCode = require('qrcode');
+const multer = require('multer');
+const path = require('path');
+const WebSocket = require('ws');
+const { v4: uuidv4 } = require('uuid');
+
+// Konfigurasi
+const app = express();
+const port = process.env.PORT || 3001;
+
+// Middleware
+app.use(helmet());
+app.use(cors());
+app.use(express.json());
+app.use(morgan('combined'));
+app.use('/uploads', express.static('uploads'));
+
+// Database connection
+const pool = new Pool({
+  user: process.env.DB_USER,
+  host: process.env.DB_HOST,
+  database: process.env.DB_NAME,
+  password: process.env.DB_PASSWORD,
+  port: process.env.DB_PORT,
+});
+
+// Authentication middleware
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  
+  if (!token) return res.sendStatus(401);
+  
+  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+    if (err) return res.sendStatus(403);
+    req.user = user;
+    next();
+  });
+};
+
+const authorizeRole = (...roles) => {
+  return (req, res, next) => {
+    if (!roles.includes(req.user.role)) {
+      return res.status(403).json({ error: 'Insufficient permissions' });
+    }
+    next();
+  };
+};
+
+// Routes akan didefinisikan di bawah
+
+// WebSocket Server untuk real-time updates
+const wss = new WebSocket.Server({ port: 8080 });
+const clients = new Map();
+
+wss.on('connection', (ws, req) => {
+  const clientId = uuidv4();
+  clients.set(clientId, ws);
+  
+  ws.on('message', (message) => {
+    // Handle incoming messages
+  });
+  
+  ws.on('close', () => {
+    clients.delete(clientId);
+  });
+});
+
+// Broadcast function untuk real-time alerts
+const broadcastAlert = (alertData) => {
+  const message = JSON.stringify({
+    type: 'alert',
+    data: alertData,
+    timestamp: new Date().toISOString()
+  });
+  
+  clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(message);
+    }
+  });
+};
+
+// File upload configuration
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, 'uploads/');
+  },
+  filename: (req, file, cb) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
+  }
+});
+
+const upload = multer({ 
+  storage,
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+  fileFilter: (req, file, cb) => {
+    const allowedTypes = /jpeg|jpg|png|gif/;
+    const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
+    const mimetype = allowedTypes.test(file.mimetype);
+    
+    if (mimetype && extname) {
+      return cb(null, true);
+    } else {
+      cb(new Error('Only image files are allowed'));
+    }
+  }
+});
+
+// Routes
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    
+    const result = await pool.query(
+      'SELECT * FROM users WHERE email = $1 AND is_active = true',
+      [email]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    
+    const user = result.rows[0];
+    const validPassword = await bcrypt.compare(password, user.password_hash);
+    
+    if (!validPassword) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    
+    // Update last login
+    await pool.query(
+      'UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = $1',
+      [user.id]
+    );
+    
+    const token = jwt.sign(
+      { 
+        id: user.id, 
+        email: user.email, 
+        role: user.role,
+        name: user.full_name 
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: '8h' }
+    );
+    
+    res.json({
+      token,
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.full_name,
+        role: user.role
+      }
+    });
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Dashboard endpoints
+app.get('/api/dashboard/metrics', authenticateToken, async (req, res) => {
+  try {
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    
+    const metrics = await pool.query(`
+      SELECT 
+        metric_date,
+        metric_type,
+        planned_value,
+        actual_value,
+        variance_percentage
+      FROM realtime_metrics
+      WHERE metric_date >= $1
+      ORDER BY metric_date DESC
+      LIMIT 30
+    `, [thirtyDaysAgo]);
+    
+    res.json(metrics.rows);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// e-Catalog endpoints
+app.get('/api/locked-prices', authenticateToken, async (req, res) => {
+  try {
+    const { cooperative_id } = req.query;
+    
+    let query = `
+      SELECT lp.*, c.name as cooperative_name
+      FROM locked_prices lp
+      JOIN cooperatives c ON lp.cooperative_id = c.id
+      WHERE lp.valid_until >= CURRENT_DATE
+    `;
+    
+    const params = [];
+    
+    if (cooperative_id) {
+      params.push(cooperative_id);
+      query += ` AND lp.cooperative_id = $${params.length}`;
+    }
+    
+    query += ' ORDER BY lp.material_name';
+    
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/locked-prices', authenticateToken, authorizeRole('owner', 'admin'), async (req, res) => {
+  try {
+    const { cooperative_id, material_name, unit, price, valid_from, valid_until } = req.body;
+    
+    const result = await pool.query(
+      `INSERT INTO locked_prices 
+       (id, cooperative_id, material_name, unit, price, valid_from, valid_until, created_by)
+       VALUES (uuid_generate_v4(), $1, $2, $3, $4, $5, $6, $7)
+       RETURNING *`,
+      [cooperative_id, material_name, unit, price, valid_from, valid_until, req.user.id]
+    );
+    
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Auto PO Generator
+app.post('/api/purchase-orders/generate', authenticateToken, authorizeRole('admin', 'warehouse_staff'), async (req, res) => {
+  try {
+    const { menu_id, distribution_date, total_beneficiaries } = req.body;
+    
+    // Get menu standard
+    const menuResult = await pool.query(
+      'SELECT * FROM menu_standards WHERE id = $1',
+      [menu_id]
+    );
+    
+    if (menuResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Menu not found' });
+    }
+    
+    const menu = menuResult.rows[0];
+    const ingredients = menu.ingredients;
+    
+    // Calculate required materials
+    const materialRequirements = {};
+    
+    for (const ingredient of ingredients) {
+      const required = ingredient.quantity * total_beneficiaries;
+      
+      // Check current inventory
+      const inventoryResult = await pool.query(
+        'SELECT quantity FROM inventory WHERE material_name = $1 AND unit = $2',
+        [ingredient.material, ingredient.unit]
+      );
+      
+      let currentStock = 0;
+      if (inventoryResult.rows.length > 0) {
+        currentStock = parseFloat(inventoryResult.rows[0].quantity);
+      }
+      
+      const toOrder = Math.max(0, required - currentStock);
+      
+      if (toOrder > 0) {
+        materialRequirements[ingredient.material] = {
+          unit: ingredient.unit,
+          quantity: toOrder,
+          required_for: required,
+          current_stock: currentStock
+        };
+      }
+    }
+    
+    // Find suppliers with locked prices for each material
+    const purchaseOrders = [];
+    const today = new Date().toISOString().split('T')[0];
+    
+    for (const [material, requirement] of Object.entries(materialRequirements)) {
+      const priceResult = await pool.query(
+        `SELECT lp.*, c.name as cooperative_name
+         FROM locked_prices lp
+         JOIN cooperatives c ON lp.cooperative_id = c.id
+         WHERE lp.material_name = $1 
+         AND lp.valid_from <= $2 
+         AND lp.valid_until >= $2
+         AND c.is_active = true
+         ORDER BY lp.price
+         LIMIT 1`,
+        [material, today]
+      );
+      
+      if (priceResult.rows.length > 0) {
+        const lockedPrice = priceResult.rows[0];
+        
+        const poNumber = `PO-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+        
+        const poResult = await pool.query(
+          `INSERT INTO purchase_orders 
+           (id, po_number, cooperative_id, order_date, delivery_date, 
+            total_amount, auto_generated, generation_logic, created_by)
+           VALUES (uuid_generate_v4(), $1, $2, $3, $4, $5, $6, $7, $8)
+           RETURNING *`,
+          [
+            poNumber,
+            lockedPrice.cooperative_id,
+            today,
+            distribution_date,
+            lockedPrice.price * requirement.quantity,
+            true,
+            {
+              menu_id,
+              distribution_date,
+              total_beneficiaries,
+              material_requirement: requirement
+            },
+            req.user.id
+          ]
+        );
+        
+        await pool.query(
+          `INSERT INTO purchase_order_items 
+           (id, po_id, material_name, unit, ordered_quantity, 
+            unit_price, total_price, locked_price_id)
+           VALUES (uuid_generate_v4(), $1, $2, $3, $4, $5, $6, $7)`,
+          [
+            poResult.rows[0].id,
+            material,
+            requirement.unit,
+            requirement.quantity,
+            lockedPrice.price,
+            lockedPrice.price * requirement.quantity,
+            lockedPrice.id
+          ]
+        );
+        
+        purchaseOrders.push(poResult.rows[0]);
+      }
+    }
+    
+    res.status(201).json({
+      message: 'Purchase orders generated successfully',
+      orders: purchaseOrders,
+      requirements: materialRequirements
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Goods Receipt dengan Blind Receiving
+app.post('/api/goods-receipts', authenticateToken, authorizeRole('warehouse_staff'), async (req, res) => {
+  try {
+    const { po_id, items } = req.body;
+    
+    // Validasi PO
+    const poResult = await pool.query(
+      'SELECT * FROM purchase_orders WHERE id = $1 AND status IN ($2, $3)',
+      [po_id, 'approved', 'pending']
+    );
+    
+    if (poResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Purchase order not found or not approved' });
+    }
+    
+    const grNumber = `GR-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    
+    // Simpan data penerimaan
+    const grResult = await pool.query(
+      `INSERT INTO goods_receipts 
+       (id, gr_number, po_id, received_by, status)
+       VALUES (uuid_generate_v4(), $1, $2, $3, 'pending')
+       RETURNING *`,
+      [grNumber, po_id, req.user.id]
+    );
+    
+    const grId = grResult.rows[0].id;
+    let totalReceived = 0;
+    
+    // Simpan item-item yang diterima
+    for (const item of items) {
+      await pool.query(
+        `INSERT INTO goods_receipt_items 
+         (id, gr_id, material_name, received_quantity, unit, 
+          weight_from_scale, scale_device_id, quality_status)
+         VALUES (uuid_generate_v4(), $1, $2, $3, $4, $5, $6, $7)`,
+        [
+          grId,
+          item.material_name,
+          item.received_quantity,
+          item.unit,
+          item.weight_from_scale,
+          item.scale_device_id,
+          item.quality_status || 'good'
+        ]
+      );
+      
+      totalReceived += parseFloat(item.weight_from_scale);
+    }
+    
+    // Update total received weight
+    await pool.query(
+      'UPDATE goods_receipts SET total_received_weight = $1 WHERE id = $2',
+      [totalReceived, grId]
+    );
+    
+    res.status(201).json({
+      message: 'Goods receipt created successfully',
+      receipt: grResult.rows[0]
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// QC Verification dengan Double Signature
+app.post('/api/goods-receipts/:id/verify', authenticateToken, authorizeRole('qc_staff'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { digital_signature } = req.body;
+    
+    const grResult = await pool.query(
+      'SELECT * FROM goods_receipts WHERE id = $1',
+      [id]
+    );
+    
+    if (grResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Goods receipt not found' });
+    }
+    
+    const gr = grResult.rows[0];
+    
+    if (gr.qc_by) {
+      return res.status(400).json({ error: 'Already verified by QC' });
+    }
+    
+    await pool.query(
+      `UPDATE goods_receipts 
+       SET qc_by = $1, digital_signature_qc = $2
+       WHERE id = $3`,
+      [req.user.id, digital_signature, id]
+    );
+    
+    // Jika warehouse sudah verifikasi juga, hitung variance
+    if (gr.warehouse_by) {
+      await calculateVarianceAndAlert(id);
+    }
+    
+    res.json({ message: 'QC verification completed' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Warehouse Verification
+app.post('/api/goods-receipts/:id/warehouse-verify', authenticateToken, authorizeRole('warehouse_staff'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { digital_signature } = req.body;
+    
+    await pool.query(
+      `UPDATE goods_receipts 
+       SET warehouse_by = $1, digital_signature_warehouse = $2
+       WHERE id = $3`,
+      [req.user.id, digital_signature, id]
+    );
+    
+    res.json({ message: 'Warehouse verification completed' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Fungsi untuk menghitung variance dan mengirim alert
+async function calculateVarianceAndAlert(grId) {
+  try {
+    // Dapatkan data PO
+    const grResult = await pool.query(
+      `SELECT gr.*, po.total_amount as expected_amount
+       FROM goods_receipts gr
+       JOIN purchase_orders po ON gr.po_id = po.id
+       WHERE gr.id = $1`,
+      [grId]
+    );
+    
+    if (grResult.rows.length === 0) return;
+    
+    const gr = grResult.rows[0];
+    
+    // Hitung total expected dari PO items
+    const poItemsResult = await pool.query(
+      `SELECT SUM(ordered_quantity) as total_ordered
+       FROM purchase_order_items
+       WHERE po_id = $1`,
+      [gr.po_id]
+    );
+    
+    const totalOrdered = parseFloat(poItemsResult.rows[0].total_ordered || 0);
+    const totalReceived = parseFloat(gr.total_received_weight || 0);
+    
+    let variancePercentage = 0;
+    if (totalOrdered > 0) {
+      variancePercentage = ((totalReceived - totalOrdered) / totalOrdered) * 100;
+    }
+    
+    // Update variance
+    await pool.query(
+      'UPDATE goods_receipts SET variance_percentage = $1 WHERE id = $2',
+      [variancePercentage, grId]
+    );
+    
+    // Kirim alert jika variance > 2%
+    if (Math.abs(variancePercentage) > 2) {
+      await pool.query(
+        'UPDATE goods_receipts SET alert_sent = true WHERE id = $1',
+        [grId]
+      );
+      
+      // Log anomaly
+      await pool.query(
+        `INSERT INTO anomaly_logs 
+         (id, anomaly_type, severity, entity_type, entity_id,
+          description, detected_value, threshold_value, 
+          percentage_difference, status)
+         VALUES (uuid_generate_v4(), $1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [
+          'quantity_variance',
+          variancePercentage > 5 ? 'high' : 'medium',
+          'goods_receipt',
+          grId,
+          `Variance in goods receipt ${gr.gr_number}: ${variancePercentage.toFixed(2)}%`,
+          totalReceived,
+          totalOrdered,
+          variancePercentage,
+          'pending'
+        ]
+      );
+      
+      // Broadcast alert via WebSocket
+      broadcastAlert({
+        type: 'variance_alert',
+        gr_number: gr.gr_number,
+        variance_percentage: variancePercentage,
+        threshold: 2,
+        timestamp: new Date().toISOString()
+      });
+    }
+    
+    // Update status PO
+    if (variancePercentage <= 2) {
+      await pool.query(
+        'UPDATE purchase_orders SET status = $1 WHERE id = $2',
+        ['delivered', gr.po_id]
+      );
+      
+      await pool.query(
+        'UPDATE goods_receipts SET status = $1 WHERE id = $2',
+        ['completed', grId]
+      );
+    } else {
+      await pool.query(
+        'UPDATE goods_receipts SET status = $1 WHERE id = $2',
+        ['partial', grId]
+      );
+    }
+    
+  } catch (error) {
+    console.error('Error calculating variance:', error);
+  }
+}
+
+// Real-time Return
+app.post('/api/goods-receipts/:id/return', authenticateToken, authorizeRole('qc_staff', 'warehouse_staff'), upload.array('photos', 5), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { item_id, quantity, reason } = req.body;
+    
+    const photos = req.files?.map(file => `/uploads/${file.filename}`) || [];
+    
+    // Update item sebagai returned
+    await pool.query(
+      `UPDATE goods_receipt_items 
+       SET is_returned = true, return_reason = $1,
+           quality_photos = $2, quality_status = 'damaged'
+       WHERE id = $3 AND gr_id = $4`,
+      [reason, JSON.stringify(photos), item_id, id]
+    );
+    
+    // Kurangi jumlah yang diterima
+    const itemResult = await pool.query(
+      'SELECT received_quantity, unit_price FROM goods_receipt_items WHERE id = $1',
+      [item_id]
+    );
+    
+    if (itemResult.rows.length > 0) {
+      const item = itemResult.rows[0];
+      const newQuantity = parseFloat(item.received_quantity) - parseFloat(quantity);
+      const deduction = parseFloat(quantity) * parseFloat(item.unit_price);
+      
+      await pool.query(
+        'UPDATE goods_receipt_items SET received_quantity = $1 WHERE id = $2',
+        [newQuantity, item_id]
+      );
+      
+      // Update total goods receipt weight
+      await pool.query(
+        `UPDATE goods_receipts 
+         SET total_received_weight = total_received_weight - $1
+         WHERE id = $2`,
+        [quantity, id]
+      );
+      
+      // Buat transaksi keuangan untuk pengurangan
+      await pool.query(
+        `INSERT INTO financial_transactions 
+         (id, transaction_number, transaction_date, transaction_type,
+          amount, payment_method, status, reference_id, reference_type)
+         VALUES (uuid_generate_v4(), $1, CURRENT_DATE, 'refund',
+                $2, 'bank_transfer', 'pending', $3, 'goods_receipt')`,
+        [
+          `REF-${Date.now()}`,
+          -deduction,
+          id
+        ]
+      );
+    }
+    
+    res.json({ message: 'Return processed successfully' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// QR Code Generation untuk Beneficiaries
+app.post('/api/beneficiaries/:id/generate-qr', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const beneficiaryResult = await pool.query(
+      'SELECT * FROM beneficiaries WHERE id = $1',
+      [id]
+    );
+    
+    if (beneficiaryResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Beneficiary not found' });
+    }
+    
+    const beneficiary = beneficiaryResult.rows[0];
+    const qrData = JSON.stringify({
+      beneficiary_id: beneficiary.beneficiary_id,
+      name: beneficiary.full_name,
+      timestamp: Date.now()
+    });
+    
+    // Generate QR code
+    const qrCode = await QRCode.toDataURL(qrData);
+    const qrHash = require('crypto').createHash('sha256').update(qrData).digest('hex');
+    
+    // Simpan hash QR code
+    await pool.query(
+      'UPDATE beneficiaries SET qr_code_hash = $1 WHERE id = $2',
+      [qrHash, id]
+    );
+    
+    res.json({
+      qr_code: qrCode,
+      qr_hash: qrHash,
+      beneficiary: {
+        id: beneficiary.beneficiary_id,
+        name: beneficiary.full_name
+      }
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Food Distribution dengan QR Verification
+app.post('/api/distributions', authenticateToken, authorizeRole('distribution_staff'), async (req, res) => {
+  try {
+    const { distribution_date, menu_id, total_portions, beneficiaries } = req.body;
+    
+    // Buat distribution record
+    const distResult = await pool.query(
+      `INSERT INTO food_distributions 
+       (id, distribution_date, menu_id, total_portions, prepared_by)
+       VALUES (uuid_generate_v4(), $1, $2, $3, $4)
+       RETURNING *`,
+      [distribution_date, menu_id, total_portions, req.user.id]
+    );
+    
+    const distributionId = distResult.rows[0].id;
+    
+    // Buat QR codes untuk setiap portion
+    const distributionDetails = [];
+    
+    for (let i = 0; i < beneficiaries.length; i++) {
+      const beneficiary = beneficiaries[i];
+      const qrData = JSON.stringify({
+        distribution_id: distributionId,
+        beneficiary_id: beneficiary.id,
+        portion_number: i + 1,
+        timestamp: Date.now()
+      });
+      
+      const qrCode = await QRCode.toDataURL(qrData);
+      
+      const detailResult = await pool.query(
+        `INSERT INTO distribution_details 
+         (id, distribution_id, beneficiary_id, qr_code, portion_number)
+         VALUES (uuid_generate_v4(), $1, $2, $3, $4)
+         RETURNING *`,
+        [distributionId, beneficiary.id, qrCode, i + 1]
+      );
+      
+      distributionDetails.push(detailResult.rows[0]);
+    }
+    
+    // Update inventory (stok keluar)
+    const menuResult = await pool.query(
+      'SELECT ingredients FROM menu_standards WHERE id = $1',
+      [menu_id]
+    );
+    
+    if (menuResult.rows.length > 0) {
+      const ingredients = menuResult.rows[0].ingredients;
+      
+      for (const ingredient of ingredients) {
+        const totalNeeded = ingredient.quantity * total_portions;
+        
+        // Kurangi stok
+        await pool.query(
+          `UPDATE inventory 
+           SET quantity = quantity - $1
+           WHERE material_name = $
